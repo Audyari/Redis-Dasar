@@ -326,3 +326,195 @@ Redis memungkinkan Anda untuk mengatur dan mendapatkan banyak kunci string sekal
 **Catatan Penting:**
 
 *   Jika Anda menjalankan Redis di foreground, server akan berhenti jika terminal ditutup. Untuk menjalankan di latar belakang (sebagai daemon), Anda perlu mengedit `redis.conf` dan mengubah `daemonize no` menjadi `daemonize yes`, lalu jalankan `redis-server /path/to/redis.conf`.
+
+### Langkah 10: Praktik Caching (Pelajaran Kita)
+
+Di bagian ini, kita akan mendokumentasikan simulasi praktis yang telah kita lakukan. Ini adalah salah satu kegunaan paling umum dari Redis: sebagai *cache* (penyimpanan sementara) untuk mempercepat aplikasi.
+
+**Konsep dasarnya sederhana:** Daripada selalu bertanya ke database yang lambat, aplikasi akan bertanya ke Redis terlebih dahulu.
+
+Mari kita rangkum alur kerja yang telah kita praktikkan.
+
+#### Tahap 1: "Cache Miss" - Saat Data Tidak Ada di Cache
+
+Ini adalah kondisi awal. Aplikasi butuh data, tetapi cache masih kosong.
+
+1.  **Aplikasi Bertanya ke Redis:** Kita mencoba mengambil data untuk kunci `artikel:123`.
+    ```
+    172.19.21.31:6379> GET artikel:123
+    (nil)
+    ```
+    *   **Artinya:** Hasil `(nil)` berarti "tidak ada". Ini adalah **Cache Miss**.
+
+2.  **Aplikasi Bekerja Keras:** Karena data tidak ada di cache, aplikasi terpaksa mengambilnya dari database utama (proses yang lambat).
+
+3.  **Aplikasi Menyimpan ke Cache:** Setelah mendapatkan data, aplikasi menyimpannya ke Redis agar permintaan berikutnya lebih cepat. Kita menggunakan `SETEX` untuk menyimpan data sekaligus memberinya "timer" kedaluwarsa 15 detik.
+    ```
+    172.19.21.31:6379> SETEX artikel:123 15 "Ini adalah isi artikel penting dari database."
+    OK
+    ```
+    *   **Artinya:** Data sekarang aman di dalam cache Redis.
+
+#### Tahap 2: "Cache Hit" - Kemenangan Caching!
+
+Sekarang, sebelum 15 detik berlalu, ada permintaan lagi untuk data yang sama.
+
+1.  **Aplikasi Bertanya ke Redis (Lagi):**
+    ```
+    172.19.21.31:6379> GET artikel:123
+    "Ini adalah isi artikel penting dari database."
+    ```
+    *   **Artinya:** Berhasil! Ini adalah **Cache Hit**. Data langsung didapat dari Redis tanpa perlu menyentuh database yang lambat. Inilah tujuan utama dari caching.
+
+#### Tahap 3: "Expiration" - Saat Data Menjadi Basi
+
+Data tidak bisa selamanya di cache, ia harus diperbarui. Itulah gunanya "timer" yang kita atur.
+
+1.  **Melihat Sisa Waktu (TTL):** Kita bisa mengintip sisa waktu hidup kunci tersebut.
+    ```
+    172.19.21.31:6379> TTL artikel:123
+    (integer) 12
+    ```
+    *   **Artinya:** Sisa waktu hidup kunci ini adalah 12 detik.
+
+2.  **Kunci Menghilang:** Setelah waktu habis, Redis secara otomatis menghapus kunci tersebut. Jika kita memeriksa TTL-nya lagi, Redis akan memberitahu kita bahwa kuncinya sudah tidak ada.
+    ```
+    172.19.21.31:6379> TTL artikel:123
+    (integer) -2
+    ```
+    *   **Artinya:** Kode `-2` dari `TTL` berarti "kunci tidak ada".
+
+3.  **Pembuktian Akhir:** Jika kita mencoba mengambil datanya lagi, kita akan kembali ke titik awal.
+    ```
+    172.19.21.31:6379> GET artikel:123
+    (nil)
+    ```
+    *   **Artinya:** Kita kembali mengalami **Cache Miss**. Siklus akan berulang dari Tahap 1.
+
+Pelajaran ini menunjukkan seluruh siklus hidup data di dalam cache, dari dibuat, digunakan, hingga akhirnya dihapus.
+
+### Langkah 11: Menghindari Race Condition dengan Operasi Atomik (INCR, DECR)
+
+Ini adalah salah satu pelajaran paling krusial dalam menggunakan Redis secara aman. Kita akan membahas masalah **Race Condition** yang muncul dari contoh kode ini:
+
+```javascript
+// race-condition.js - CONTOH YANG SALAH!
+let value = await redis.get("key");
+value = Number(value) + 1;
+await redis.set("key", value);
+```
+
+**Masalahnya:** Proses "ambil, ubah, simpan" ini tidak terjadi dalam sekejap. Ada jeda waktu, dan di situlah letak bahayanya jika ada banyak pengguna.
+
+**Skenario Bencana (Race Condition):**
+Bayangkan ada dua pengunjung, A dan B, menaikkan penghitung `visitor_count` yang nilainya `100`.
+1.  Pengunjung A `GET` nilai -> mendapat `100`.
+2.  Pengunjung B `GET` nilai -> juga mendapat `100` (karena A belum selesai).
+3.  Pengunjung A menghitung `100 + 1` dan `SET` nilainya menjadi `101`.
+4.  Pengunjung B juga menghitung `100 + 1` dan `SET` nilainya menjadi `101`.
+
+**Hasil Akhir:** `visitor_count` menjadi `101`.
+**Hasil yang Seharusnya:** `102`. Satu penambahan telah hilang!
+
+#### Solusi: Perintah Atomik Redis
+
+Redis menyediakan perintah yang bersifat **atomik**, artinya seluruh operasi (ambil, ubah, simpan) dijamin selesai tanpa bisa diinterupsi.
+
+Mari kita praktikkan perbedaannya.
+
+**1. Siapkan Penghitung Awal**
+```
+172.19.21.31:6379> SET visitor_count 100
+OK
+```
+
+**2. Cara yang Salah (Manual)**
+Ini adalah cara yang kita simulasikan sebagai "tidak aman".
+```
+172.19.21.31:6379> GET visitor_count
+"100"
+172.19.21.31:6379> SET visitor_count 101
+OK
+```
+*   **Artinya:** Berhasil, tetapi tidak aman karena ada jeda waktu antara `GET` dan `SET`.
+
+**3. Cara yang Benar dan Aman (Atomik)**
+Gunakan perintah `INCR` yang dirancang khusus untuk ini.
+```
+172.19.21.31:6379> INCR visitor_count
+(integer) 102
+```
+*   **Artinya:** Redis langsung menaikkan nilainya dan mengembalikan hasil **setelah** operasi selesai. Ini 100% aman. Setiap perintah `INCR` berikutnya akan menaikkan nilainya dengan benar (`103`, `104`, dst.).
+
+**4. Keluarga Perintah Atomik Lainnya**
+*   **Menurunkan nilai:** `DECR visitor_count`
+*   **Menambah dalam jumlah banyak:** `INCRBY visitor_count 5`
+*   **Mengurangi dalam jumlah banyak:** `DECRBY visitor_count 5`
+
+**Aturan Emas:**
+Untuk operasi hitung-menghitung (counters, likes, views, inventory), **JANGAN PERNAH** menggunakan pola `GET-Ubah-SET` manual. **SELALU** gunakan `INCR`, `DECR`, `INCRBY`, atau `DECRBY`.
+
+### Langkah 12: Implementasi Penghitung Pengunjung Website (Praktik INCR/DECR)
+
+Mari kita terapkan pemahaman kita tentang operasi atomik dengan membuat sebuah **penghitung pengunjung website** sederhana. Ini adalah skenario umum di mana `INCR` dan `DECR` sangat dibutuhkan untuk menjaga konsistensi data.
+
+**Skenario:** Kita ingin menghitung jumlah pengunjung aktif di website kita. Setiap kali pengunjung datang, penghitung bertambah. Setiap kali pengunjung pergi, penghitung berkurang.
+
+**Prasyarat:**
+*   Pastikan server Redis Anda berjalan.
+*   Pastikan Anda berada di `redis-cli`.
+
+#### 1. Inisialisasi Penghitung Pengunjung
+
+Kita akan mengatur nilai awal untuk penghitung kita.
+
+```
+172.19.21.31:6379> SET website_visitors 0
+OK
+172.19.21.31:6379> GET website_visitors
+"0"
+```
+*   **Penjelasan:** Kita memulai penghitung `website_visitors` dari `0`.
+
+#### 2. Simulasikan Pengunjung Baru (Menggunakan `INCR`)
+
+Setiap kali ada pengunjung baru datang, kita akan menaikkan penghitungnya.
+
+```
+172.19.21.31:6379> INCR website_visitors
+(integer) 1
+172.19.21.31:6379> INCR website_visitors
+(integer) 2
+172.19.21.31:6379> INCR website_visitors
+(integer) 3
+```
+*   **Penjelasan:** Perintah `INCR` secara atomik menaikkan nilai kunci sebesar 1. Perhatikan bagaimana Redis langsung mengembalikan nilai terbaru setelah penambahan.
+
+#### 3. Simulasikan Kedatangan Banyak Pengunjung Sekaligus (Menggunakan `INCRBY`)
+
+Jika ada beberapa pengunjung datang bersamaan, kita bisa menaikkan penghitung dalam jumlah tertentu.
+
+```
+172.19.21.31:6379> INCRBY website_visitors 5
+(integer) 8
+172.19.21.31:6379> GET website_visitors
+"8"
+```
+*   **Penjelasan:** `INCRBY` menaikkan nilai kunci sebesar jumlah yang ditentukan (dalam contoh ini, 5).
+
+#### 4. Simulasikan Pengunjung Meninggalkan Website (Menggunakan `DECR` dan `DECRBY`)
+
+Untuk mengurangi jumlah pengunjung, kita gunakan `DECR` atau `DECRBY`.
+
+```
+172.19.21.31:6379> DECR website_visitors
+(integer) 7
+172.19.21.31:6379> DECRBY website_visitors 2
+(integer) 5
+172.19.21.31:6379> GET website_visitors
+"5"
+```
+*   **Penjelasan:** `DECR` mengurangi nilai sebesar 1, dan `DECRBY` mengurangi nilai sebesar jumlah yang ditentukan (dalam contoh ini, 2).
+
+**Kesimpulan Implementasi:**
+Anda telah berhasil mengimplementasikan penghitung yang aman dari *race condition* menggunakan perintah atomik Redis. Ini adalah fondasi penting untuk banyak fitur aplikasi yang membutuhkan penghitungan yang akurat.
